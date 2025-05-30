@@ -352,6 +352,87 @@ func (w *NgWriter) WriteInterfaceStats(intf int, stats NgInterfaceStatistics) er
 	return err
 }
 
+// WritePacket writes out packet with the given data and capture info,
+// with optional comment added as an EPB option.
+func (w *NgWriter) WritePacketWithComment(ci gopacket.CaptureInfo, data []byte, comment string) error {
+	if ci.InterfaceIndex >= int(w.intf) || ci.InterfaceIndex < 0 {
+		return fmt.Errorf("Can't send statistics for non existent interface %d; have only %d interfaces", ci.InterfaceIndex, w.intf)
+	}
+	if ci.CaptureLength != len(data) {
+		return fmt.Errorf("capture length %d does not match data length %d", ci.CaptureLength, len(data))
+	}
+	if ci.CaptureLength > ci.Length {
+		return fmt.Errorf("invalid capture info %+v:  capture length > length", ci)
+	}
+
+	// Base length: 32 bytes fixed header + packet data length
+	length := uint32(len(data)) + 32
+
+	// Calculate padding to align packet data to 32-bit boundary
+	padding := (4 - length&3) & 3
+	length += padding
+
+	// Prepare options buffer for comment
+	var opts []byte
+	if comment != "" {
+		commentBytes := []byte(comment)
+		optLen := len(commentBytes)
+		optPad := (4 - (optLen % 4)) % 4
+
+		// Option code 1 (uint16 little endian)
+		opts = append(opts, 0x01, 0x00)
+		// Option length (uint16 little endian)
+		opts = append(opts, byte(optLen), 0x00)
+		// Comment data
+		opts = append(opts, commentBytes...)
+		// Pad to 32-bit boundary
+		for i := 0; i < optPad; i++ {
+			opts = append(opts, 0x00)
+		}
+	}
+
+	// Add end of options (code=0, length=0)
+	opts = append(opts, 0x00, 0x00, 0x00, 0x00)
+
+	// Add options length to total block length
+	length += uint32(len(opts))
+
+	ts := ci.Timestamp.UnixNano()
+
+	// Write EPB header fields
+	binary.LittleEndian.PutUint32(w.buf[:4], uint32(ngBlockTypeEnhancedPacket))
+	binary.LittleEndian.PutUint32(w.buf[4:8], length)
+	binary.LittleEndian.PutUint32(w.buf[8:12], uint32(ci.InterfaceIndex))
+	binary.LittleEndian.PutUint32(w.buf[12:16], uint32(ts>>32))
+	binary.LittleEndian.PutUint32(w.buf[16:20], uint32(ts))
+	binary.LittleEndian.PutUint32(w.buf[20:24], uint32(ci.CaptureLength))
+	binary.LittleEndian.PutUint32(w.buf[24:28], uint32(ci.Length))
+
+	if _, err := w.w.Write(w.buf[:28]); err != nil {
+		return err
+	}
+
+	if _, err := w.w.Write(data); err != nil {
+		return err
+	}
+
+	if padding > 0 {
+		if _, err := w.w.Write(make([]byte, padding)); err != nil {
+			return err
+		}
+	}
+
+	// Write options
+	if _, err := w.w.Write(opts); err != nil {
+		return err
+	}
+
+	// Write trailing block length
+	binary.LittleEndian.PutUint32(w.buf[:4], length)
+	_, err := w.w.Write(w.buf[:4])
+	return err
+}
+
 // WritePacket writes out packet with the given data and capture info. The given InterfaceIndex must already be added to the file. InterfaceIndex 0 is automatically added by the NewWriter* methods.
 func (w *NgWriter) WritePacket(ci gopacket.CaptureInfo, data []byte) error {
 	if ci.InterfaceIndex >= int(w.intf) || ci.InterfaceIndex < 0 {
